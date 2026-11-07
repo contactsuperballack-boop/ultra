@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres_test:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ultra
+          POSTGRES_PASSWORD: ultra_test_password
+          POSTGRES_DB: ultra_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U ultra"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://ultra:ultra_test_password@localhost:5433/ultra_test
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET: ci-test-secret-not-for-production
+      PAYSTACK_SECRET_KEY: sk_test_ci_placeholder
+      # Priority-checklist fix (dedicated test coverage for uploads.ts,
+      # closing a confirmed zero-coverage gap): getSignedUrl from
+      # @aws-sdk/s3-request-presigner computes the signature locally —
+      # it never makes a network call to R2 — so these values only need
+      # to be non-empty strings to exercise the real presign code path in
+      # CI, the same "give it a fake-but-present value" pattern already
+      # used above for PAYSTACK_SECRET_KEY. This does NOT mean an actual
+      # file could be uploaded against these — only that createPresignedUpload()
+      # can be tested end-to-end rather than only its pre-network
+      # validation logic.
+      R2_ACCOUNT_ID: ci-test-account-id
+      R2_ACCESS_KEY_ID: ci-test-access-key
+      R2_SECRET_ACCESS_KEY: ci-test-secret-key
+      R2_BUCKET_NAME: ultra-test-public
+      R2_PRIVATE_BUCKET_NAME: ultra-test-private
+      R2_PUBLIC_BASE_URL: https://ci-test-placeholder.r2.dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests (packages/db)
+        run: pnpm --filter @ultra/db test
+
+      - name: Unit tests (packages/api)
+        run: pnpm --filter @ultra/api test:unit
+
+      - name: Push schema to test DB
+        run: pnpm --filter @ultra/db exec prisma db push
+
+      - name: Integration tests
+        run: pnpm --filter @ultra/api test:integration
+
+      - name: Build
+        run: pnpm build
