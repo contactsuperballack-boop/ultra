@@ -1,0 +1,37 @@
+"use client";
+
+import { useState } from "react";
+import { trpc } from "@/lib/trpc";
+
+const statuses = ["ACTIVE", "OPEN", "IN_PROGRESS", "WAITING_ON_CUSTOMER", "RESOLVED", "CLOSED", "ALL"] as const;
+export default function AdminSupportPage() {
+  const utils = trpc.useUtils();
+  const [status, setStatus] = useState<(typeof statuses)[number]>("ACTIVE");
+  const [selected, setSelected] = useState<string | null>(null);
+  const [reply, setReply] = useState("");
+  const [internalNote, setInternalNote] = useState("");
+  const [resolutionNote, setResolutionNote] = useState("");
+  const queue = trpc.admin.supportQueue.useQuery({ status, limit: 50 });
+  const admins = trpc.admin.adminAssignees.useQuery();
+  const update = trpc.admin.updateSupportTicket.useMutation({ onSuccess: async () => { await utils.admin.supportQueue.invalidate(); setReply(""); setInternalNote(""); } });
+  const ticket = queue.data?.items.find((item) => item.id === selected);
+  const act = (values: Parameters<typeof update.mutate>[0]) => update.mutate(values);
+  return <main className="mx-auto max-w-7xl px-5 py-8 sm:px-8">
+    <h1 className="text-2xl font-semibold text-stone-900">Support desk</h1><p className="mt-1 text-sm text-stone-500">Triage customer cases, assign ownership, send replies and keep internal notes separate from customer-visible messages.</p>
+    <div className="mt-5 flex flex-wrap gap-2">{statuses.map((s)=><button key={s} onClick={()=>{setStatus(s);setSelected(null);}} className={`rounded-lg border px-3 py-2 text-xs font-medium ${status===s?"border-stone-900 bg-stone-900 text-white":"border-stone-300 bg-white text-stone-600"}`}>{s.replaceAll("_"," ")}</button>)}</div>
+    {queue.error && <p className="mt-4 text-sm text-red-700">{queue.error.message}</p>}
+    <div className="mt-5 grid gap-5 lg:grid-cols-[minmax(280px,0.85fr)_minmax(0,1.5fr)]">
+      <div className="space-y-2">{queue.isLoading && <p className="text-sm text-stone-500">Loading cases…</p>}{queue.data?.items.map((item)=><button key={item.id} onClick={()=>setSelected(item.id)} className={`w-full rounded-xl border p-4 text-left ${selected===item.id?"border-stone-900 bg-stone-50":"border-stone-200 bg-white"}`}><div className="flex justify-between gap-2"><span className="text-sm font-semibold text-stone-900">{item.subject}</span><span className={`text-[10px] font-semibold ${item.priority==="URGENT"?"text-red-700":item.priority==="HIGH"?"text-amber-700":"text-stone-500"}`}>{item.priority}</span></div><p className="mt-1 text-xs text-stone-500">{item.requester.name} · {item.category.replaceAll("_"," ")}</p><p className="mt-2 text-[11px] text-stone-400">{item.status.replaceAll("_"," ")} · {new Date(item.createdAt).toLocaleDateString()}</p></button>)}{queue.data?.items.length===0&&<p className="rounded-xl border border-dashed border-stone-300 p-6 text-sm text-stone-500">No tickets in this queue.</p>}</div>
+      <div className="rounded-xl border border-stone-200 bg-white p-5">{!ticket?<p className="py-12 text-center text-sm text-stone-500">Select a ticket to review its history and take action.</p>:<>
+        <div className="flex flex-wrap justify-between gap-3"><div><h2 className="text-lg font-semibold text-stone-900">{ticket.subject}</h2><p className="mt-1 text-xs text-stone-500">{ticket.requester.name} · {ticket.requester.phone} · {ticket.requester.role}</p></div><span className="text-xs text-stone-500">Opened {new Date(ticket.createdAt).toLocaleString()}</span></div>
+        <p className="mt-4 whitespace-pre-wrap rounded-lg bg-stone-50 p-3 text-sm text-stone-700">{ticket.description}</p>
+        <div className="mt-4 space-y-3">{ticket.messages.map((m)=><div key={m.id} className={`rounded-lg p-3 ${m.internal?"border border-amber-200 bg-amber-50":"bg-stone-50"}`}><div className="flex justify-between gap-2 text-[11px] text-stone-500"><span>{m.author.name} · {m.internal?"Internal note":"Message"}</span><span>{new Date(m.createdAt).toLocaleString()}</span></div><p className="mt-2 whitespace-pre-wrap text-sm text-stone-700">{m.body}</p></div>)}</div>
+        <div className="mt-5 grid gap-3 sm:grid-cols-2"><label className="text-xs text-stone-600">Status<select value={ticket.status} onChange={(e)=>act({ticketId:ticket.id,status:e.target.value as any})} className="mt-1 w-full rounded-lg border border-stone-300 p-2 text-sm">{["OPEN","IN_PROGRESS","WAITING_ON_CUSTOMER"].map(s=><option key={s} value={s}>{s.replaceAll("_"," ")}</option>)}</select></label><label className="text-xs text-stone-600">Priority<select value={ticket.priority} onChange={(e)=>act({ticketId:ticket.id,priority:e.target.value as any})} className="mt-1 w-full rounded-lg border border-stone-300 p-2 text-sm">{["LOW","NORMAL","HIGH","URGENT"].map(s=><option key={s}>{s}</option>)}</select></label><label className="text-xs text-stone-600 sm:col-span-2">Assigned administrator<select value={ticket.assignedAdminId??""} onChange={(e)=>act({ticketId:ticket.id,assignedAdminId:e.target.value||null})} className="mt-1 w-full rounded-lg border border-stone-300 p-2 text-sm"><option value="">Unassigned</option>{admins.data?.map(a=><option key={a.id} value={a.id}>{a.name} · {a.role}</option>)}</select></label></div>
+        <div className="mt-5 border-t border-stone-100 pt-4"><label className="text-xs font-medium text-stone-600">Customer reply</label><textarea value={reply} onChange={e=>setReply(e.target.value)} rows={3} className="mt-1 w-full rounded-lg border border-stone-300 p-3 text-sm" placeholder="Write a response visible to the customer…"/><button disabled={!reply.trim()||update.isPending} onClick={()=>act({ticketId:ticket.id,reply})} className="mt-2 rounded-lg bg-stone-900 px-4 py-2 text-xs font-semibold text-white disabled:opacity-50">Send reply</button></div>
+        <div className="mt-4"><label className="text-xs font-medium text-amber-800">Internal note (not visible to customer)</label><textarea value={internalNote} onChange={e=>setInternalNote(e.target.value)} rows={2} className="mt-1 w-full rounded-lg border border-amber-200 bg-amber-50/40 p-3 text-sm" placeholder="Add context for other support agents…"/><button disabled={!internalNote.trim()||update.isPending} onClick={()=>act({ticketId:ticket.id,internalNote})} className="mt-2 rounded-lg border border-amber-300 px-4 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">Save internal note</button></div>
+        <div className="mt-4"><label className="text-xs text-stone-600">Resolution note</label><textarea value={resolutionNote} onChange={e=>setResolutionNote(e.target.value)} rows={2} className="mt-1 w-full rounded-lg border border-stone-300 p-3 text-sm" placeholder="Document how the issue was resolved…"/><div className="mt-2 flex flex-wrap gap-2"><button disabled={resolutionNote.trim().length<5||update.isPending} onClick={()=>act({ticketId:ticket.id,resolutionNote,status:"RESOLVED"})} className="rounded-lg bg-emerald-700 px-4 py-2 text-xs font-semibold text-white disabled:opacity-50">Resolve ticket</button><button disabled={resolutionNote.trim().length<5||update.isPending} onClick={()=>act({ticketId:ticket.id,resolutionNote,status:"CLOSED"})} className="rounded-lg border border-stone-300 px-4 py-2 text-xs font-semibold text-stone-700 disabled:opacity-50">Close ticket</button></div></div>
+        {update.error&&<p className="mt-3 text-xs text-red-700">{update.error.message}</p>}
+      </>}</div>
+    </div>
+  </main>;
+}

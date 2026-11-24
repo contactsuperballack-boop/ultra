@@ -1,0 +1,1136 @@
+// ULTRA — Core Data Model
+// Mirrors Master Blueprint v2.0, Sections 8-10 (Phase 1 Scope, Trust Framework, Listing Flow)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// USERS — both buyers and realtors are Users;
+// role + realtorProfile distinguish the two.
+// ─────────────────────────────────────────────
+
+enum UserRole {
+  BUYER
+  REALTOR
+  PROVIDER
+  ADMIN
+  SUPER_ADMIN
+}
+
+model User {
+  id            String    @id @default(cuid())
+  phone         String    @unique // primary identity anchor — Nigerian market runs on phone, not email
+  phoneVerified Boolean   @default(false)
+  email         String?   @unique
+  name          String
+  role          UserRole  @default(BUYER)
+  pushToken     String? // Expo push token — single device for MVP; multi-device would need a separate table
+  // Readiness §8 — "define account deletion behavior." Soft-deactivation,
+  // not a hard delete: Messages, Inquiries, ServiceRequests, and
+  // PaymentTransactions this user is party to are legitimately part of
+  // the OTHER party's record too (a realtor's inbox, a provider's
+  // completed-job history, the platform's own financial ledger) and
+  // deleting them would silently corrupt someone else's data. See
+  // docs/DATA_RETENTION.md for the full policy and exactly what does and
+  // doesn't get redacted on deactivation.
+  deactivatedAt      DateTime?
+  deactivationReason String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  realtorProfile RealtorProfile?
+  providerProfile ProviderProfile? // Phase 2 — Home Services (Blueprint §13)
+  savedListings  SavedListing[]
+  savedSearches  SavedSearch[]
+  recurringAgreements RecurringAgreement[] @relation("RecurringAgreementCustomer")
+  inquiriesSent  Inquiry[]        @relation("InquiryBuyer")
+  inspectionRequests InspectionRequest[] @relation("InspectionBuyer")
+  reviewsWritten Review[]
+  messagesSent   Message[]
+  refreshTokens  RefreshToken[]
+  notifications  Notification[]
+  notificationPreference NotificationPreference?
+
+  serviceRequestsSent ServiceRequest[] @relation("ServiceRequestCustomer")
+  serviceMessagesSent ServiceMessage[]
+  reportsFiled        Report[]
+  supportTickets      SupportTicket[] @relation("SupportTicketRequester")
+  supportMessages     SupportTicketMessage[] @relation("SupportTicketMessageAuthor")
+}
+
+// ─────────────────────────────────────────────
+// AUTH — Phone OTP + JWT access token / hashed refresh token.
+// No third-party auth provider (Clerk/NextAuth) — phone OTP is the only
+// method Phase 1 needs, and owning it directly avoids paying for and
+// integrating machinery this product doesn't use yet.
+// ─────────────────────────────────────────────
+
+model OtpCode {
+  id        String   @id @default(cuid())
+  phone     String
+  codeHash  String // never store the raw code
+  expiresAt DateTime
+  attempts  Int      @default(0) // brute-force guard — see MAX_OTP_ATTEMPTS in auth router
+  consumedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([phone, createdAt])
+}
+
+model RefreshToken {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  tokenHash  String    @unique // raw token is never persisted
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  replacedBy String? // set on rotation, for audit/debugging token-reuse detection
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────
+// REALTOR VERIFICATION — Blueprint §9
+// A realtor cannot list until VerificationStatus = VERIFIED.
+// This table is the audit trail, not just a boolean.
+// ─────────────────────────────────────────────
+
+enum DevelopmentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum VerificationStatus {
+  UNVERIFIED
+  PENDING_REVIEW
+  VERIFIED
+  REJECTED
+  SUSPENDED
+}
+
+enum SubscriptionTier {
+  FREE
+  PREMIUM
+}
+
+model RealtorProfile {
+  id                    String              @id @default(cuid())
+  userId                String              @unique
+  user                  User                @relation(fields: [userId], references: [id])
+  agencyName            String
+  cacRegistrationNo     String? // Corporate Affairs Commission business registration
+  idDocumentUrl         String?
+  verificationStatus    VerificationStatus  @default(UNVERIFIED)
+  verifiedAt            DateTime?
+  verifiedByAdminId     String?
+  // Readiness §3A — "do not use one generic verified badge if the
+  // underlying checks differ." Both are set together at VERIFIED approval
+  // (see realtors.adminSetVerificationStatus) since the current one-step
+  // application already requires both an ID doc and CAC/agency info before
+  // an admin approves — this is an honest split of what a single approval
+  // action actually checks, not a claim of a review process that doesn't
+  // exist yet. Genuinely separable if the application flow is ever split
+  // into stages later.
+  identityVerified      Boolean             @default(false) // Level 1 — phone verified + government ID reviewed
+  businessVerified       Boolean             @default(false) // Level 2 — CAC/agency info reviewed, identity linked to agency
+  rating                Float?
+  responseTimeMins      Int? // rolling average, computed from Message timestamps
+  creditBalanceNaira    BigInt              @default(0) // prepaid lead-fee balance — see PaymentTransaction
+  subscriptionTier      SubscriptionTier    @default(FREE)
+  subscriptionExpiresAt DateTime? // null or in the past = effectively FREE regardless of subscriptionTier value; search ranking checks this, not just the tier field
+  // Readiness §3D — "restrict a realtor after repeated reports." Distinct
+  // from verificationStatus=SUSPENDED: a restriction is a lighter, reportdriven action (e.g. "can't publish new listings for now") that doesn't
+  // necessarily reopen the whole verification question the way a full
+  // suspension does. Enforced in listings.create — see that router.
+  restrictedAt          DateTime?
+  restrictedReason      String?
+  createdAt             DateTime            @default(now())
+
+  listings            Listing[]
+  developments        Development[]
+  reviewsReceived      Review[]
+  verificationLogs     VerificationLog[]
+  paymentTransactions  PaymentTransaction[]
+
+  @@index([verificationStatus])
+}
+
+// Every state change in the verification pipeline is logged —
+// this is what "hand-review the first cohort" (Blueprint §9) becomes in the schema.
+model VerificationLog {
+  id               String              @id @default(cuid())
+  realtorProfileId String
+  realtorProfile   RealtorProfile      @relation(fields: [realtorProfileId], references: [id])
+  fromStatus       VerificationStatus
+  toStatus         VerificationStatus
+  note             String?
+  actorAdminId     String? // null if system-triggered
+  createdAt        DateTime            @default(now())
+}
+
+// ─────────────────────────────────────────────
+// LISTINGS — Blueprint §10 Listing & Transaction Flow
+// ─────────────────────────────────────────────
+
+enum ListingType {
+  SALE
+  RENT
+  LAND
+}
+
+// Readiness §9 — "the data model should explicitly support residential,
+// commercial, land... do not rely on free-text to distinguish important
+// property categories." Distinct from ListingType: type is the
+// transaction (sale/rent/land), category is what the building actually
+// is. Only meaningful for SALE/RENT (a LAND listing's category is LAND by
+// definition, not a separate field to keep in sync). Blueprint §8 scopes
+// Phase 1 to "completed residential and commercial buildings" explicitly
+// — this field is what actually lets that distinction be queried, which
+// nothing before this did.
+enum PropertyCategory {
+  RESIDENTIAL
+  COMMERCIAL
+}
+
+// Readiness §9 — price frequency, standardized rather than assumed. RENT
+// listings previously had the "/year" suffix hardcoded in the UI with
+// nothing in the data actually saying so.
+enum PriceFrequency {
+  ONE_TIME // SALE, LAND
+  PER_YEAR
+  PER_MONTH
+}
+
+enum Furnishing {
+  FURNISHED
+  UNFURNISHED
+  PARTLY_FURNISHED
+  NOT_APPLICABLE // LAND
+}
+
+// Nigerian land is commonly sold "per plot," not just by sqm — this is a
+// display/label field, not a unit-conversion engine (no fixed plot→sqm
+// ratio is assumed or computed). sizeSqm remains the one canonical stored
+// figure everything else (price-band checks, search) is computed against.
+enum LandSizeUnit {
+  SQM
+  PLOTS
+  ACRES
+  HECTARES
+}
+
+enum LocationPrecision {
+  EXACT
+  APPROXIMATE // pairs with the "Ask for exact location" quick-action already on the listing detail page
+}
+
+enum ListingStatus {
+  DRAFT
+  PENDING_REVIEW // flagged or awaiting standard checks — Blueprint §10 step 2
+  LIVE
+  UNDER_REVIEW // published but flagged post-hoc (price/fraud pattern signal)
+  SOLD
+  RENTED
+  REMOVED
+}
+
+enum OwnershipEvidence {
+  OWNER_LISTING
+  AUTHORIZED_AGENT
+  AGENCY_MANDATE
+  DEVELOPER_LISTING
+  LAND_REPRESENTATIVE
+  PENDING // default — Readiness §3C: admins should know why a listing was approved, "pending" is an honest starting state, not a guess
+}
+
+model Listing {
+  id               String         @id @default(cuid())
+  realtorProfileId String
+  realtorProfile   RealtorProfile @relation(fields: [realtorProfileId], references: [id])
+  title            String
+  description      String
+  type             ListingType
+  category         PropertyCategory? // null for LAND listings — see enum comment
+  status           ListingStatus  @default(DRAFT)
+  priceNaira       BigInt
+  priceCurrency    String         @default("NGN") // Phase 1 is NGN-only, but every price already flows through this field rather than assuming it downstream — Readiness §9 "standardize currency"
+  priceFrequency   PriceFrequency @default(ONE_TIME)
+  serviceChargeNaira BigInt? // common in Nigerian rentals — a separate annual charge, not folded into priceNaira
+  negotiable       Boolean        @default(false)
+  features         String[]       @default([]) // keys from packages/db/src/listingFeatures.ts — validated server-side against that closed list
+  // Property Profile (all optional; credits are supplied by the realtor and are NOT independently verified — the UI says so)
+  architect          String?
+  builder            String?
+  developer          String?
+  completionYear     Int?        // ULTRA lists completed properties only, so a year, not a "status"
+  ownerStatement     String?
+  statementAuthorRole StatementAuthorRole? // required whenever ownerStatement is set — a statement must never read as the owner's when it isn't
+  statementAuthorName String?
+  youtubeVideoId     String?     // the validated 11-char ID only, never the pasted URL
+  model3dUrl         String?     // only ever a .glb this realtor uploaded through ULTRA (see packages/db/src/modelAsset.ts)
+  // Part of a development? The development holds the shared facts once; this unit holds its own number, price and availability.
+  developmentId      String?
+  development        Development? @relation(fields: [developmentId], references: [id])
+  unitNumber         String?     // normalised by packages/db/src/development.ts; unique within a development
+  furnishing       Furnishing     @default(NOT_APPLICABLE)
+  landSizeUnit     LandSizeUnit?  // set only when type = LAND — display label, see enum comment
+  availableFrom    DateTime? // null = available now
+  locationPrecision LocationPrecision @default(APPROXIMATE) // honest default — most listings won't have an exact pin day one
+  area             String // e.g. "Maitama"
+  city             String         @default("Abuja") // Phase 1 is single-city; field exists for Phase 5 expansion
+  bedrooms         Int?
+  bathrooms        Int?
+  sizeSqm          Int
+  photos           ListingPhoto[]
+  // Video only applies to completed buildings (SALE/RENT), never LAND —
+  // enforced at the application layer (uploads router + create mutation),
+  // not a DB constraint, since Prisma can't express "required only for
+  // some enum values" declaratively.
+  videoUrl         String?
+  flagReason       String? // set when a price-band or duplicate check fails — surfaces in realtor dashboard
+  // Readiness §3A, Level 3 ("listing reviewed") and Level 4 ("property
+  // evidence verified"). Deliberately separate fields, not folded into
+  // ListingStatus — a listing can be LIVE (published) while still only
+  // partway through the verification-level ladder; these track what was
+  // actually checked, status tracks whether it's visible to buyers.
+  listingReviewed   Boolean           @default(false) // set true by listings.adminSetStatus on approval to LIVE
+  lastReviewedAt    DateTime?
+  ownershipEvidence OwnershipEvidence @default(PENDING) // admin-set — see listings.adminSetOwnershipEvidence
+  viewCount        Int            @default(0)
+  publishedAt      DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  savedBy        SavedListing[]
+  inquiries      Inquiry[]
+  inspections    InspectionRequest[]
+  moderationLogs ListingModerationLog[]
+  reports        Report[]
+
+  @@index([status, city, type])
+  @@index([area])
+  @@index([priceNaira]) // Readiness §2A — price filtering/sorting on search
+  @@unique([developmentId, unitNumber])
+  @@index([developmentId, status])
+}
+
+// Mirrors VerificationLog's pattern — every admin-driven status change on a
+// listing (approve out of review, remove for moderation) is logged, not
+// just applied silently.
+model ListingModerationLog {
+  id           String        @id @default(cuid())
+  listingId    String
+  listing      Listing       @relation(fields: [listingId], references: [id])
+  fromStatus   ListingStatus
+  toStatus     ListingStatus
+  note         String?
+  actorAdminId String
+  createdAt    DateTime      @default(now())
+}
+
+enum StatementAuthorRole {
+  OWNER
+  DEVELOPER
+  AUTHORISED_REPRESENTATIVE
+}
+
+enum RoomType {
+  FLOOR_PLAN
+  LIVING_ROOM
+  KITCHEN
+  BEDROOM
+  BATHROOM
+  EXTERIOR
+  OTHER
+}
+
+model ListingPhoto {
+  id        String    @id @default(cuid())
+  listingId String
+  listing   Listing   @relation(fields: [listingId], references: [id])
+  url       String
+  roomType  RoomType? // optional tag — "Living Room", "Kitchen", etc. Not applicable/required for LAND listings.
+  sortOrder Int       @default(0)
+  // 64-bit dHash computed in the browser before image optimisation/upload.
+  // Nullable for legacy records and clients that cannot decode the image;
+  // matches only route the new listing to human review, never auto-reject.
+  contentHash String?
+
+  @@index([contentHash])
+}
+
+model SavedListing {
+  userId    String
+  listingId String
+  user      User     @relation(fields: [userId], references: [id])
+  listing   Listing  @relation(fields: [listingId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@id([userId, listingId])
+}
+
+// Buyer-defined search criteria. Alerts are created only when an admin
+// publishes a matching listing; drafts and listings awaiting moderation
+// never trigger buyer-facing notifications.
+model SavedSearch {
+  id             String          @id @default(cuid())
+  userId         String
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  type           ListingType?
+  category       PropertyCategory?
+  area           String?
+  query          String?
+  minPriceNaira  BigInt?
+  maxPriceNaira  BigInt?
+  minBeds        Int?
+  minBathrooms   Int?
+  verifiedOnly   Boolean         @default(false)
+  alertEnabled   Boolean         @default(true)
+  lastMatchedAt  DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([alertEnabled, type, category])
+}
+
+// ─────────────────────────────────────────────
+// INQUIRIES & MESSAGES — Blueprint §10, §12
+// Inquiry = the billable lead event ("pay for the touchpoint").
+// Message = the in-app thread that keeps contact off phone numbers,
+// which is itself the anti-disintermediation control from §10/§12.
+// ─────────────────────────────────────────────
+
+model Inquiry {
+  id        String    @id @default(cuid())
+  listingId String
+  listing   Listing   @relation(fields: [listingId], references: [id])
+  buyerId   String
+  buyer     User      @relation("InquiryBuyer", fields: [buyerId], references: [id])
+  billed    Boolean   @default(false) // per-lead fee charged — Blueprint §12
+  createdAt DateTime  @default(now())
+
+  messages Message[]
+  inspections InspectionRequest[]
+
+  // Postgres does not auto-index foreign key columns (unlike MySQL) — these
+  // back the ownership checks in inquiries.byId/myThreads/forRealtor, which
+  // filter on exactly these two columns. Readiness §2A calls this out by
+  // name ("inquiry ownership").
+  @@index([buyerId])
+  @@index([listingId])
+  // Remediation (Phase 1 trust/data-integrity pass): a buyer should only
+  // ever have ONE inquiry thread per listing — inquiries.create's dedup
+  // logic always intended this, but without a DB-level constraint, two
+  // concurrent create calls for the same buyer+listing could both pass
+  // the pre-check and create two rows (double lead-fee charge, a split
+  // thread). This constraint is the actual guard; inquiries.create
+  // catches the resulting unique-violation and falls back to the
+  // append-to-existing-thread path instead of erroring the second caller.
+  @@unique([listingId, buyerId])
+}
+
+// An estate, complex or tower: one parent record that many unit Listings point at.
+// Shared facts live here once; each unit keeps its own number, price and availability.
+model Development {
+  id               String         @id @default(cuid())
+  realtorProfileId String
+  realtorProfile   RealtorProfile @relation(fields: [realtorProfileId], references: [id])
+  name             String
+  description      String
+  area             String
+  city             String         @default("Abuja")
+  architect        String?
+  builder          String?
+  developer        String?
+  completionYear   Int?
+  youtubeVideoId   String?        // validated ID only, never the pasted URL
+  status           DevelopmentStatus @default(PENDING)
+  moderationNote   String?
+  reviewedAt       DateTime?
+  reviewedByAdminId String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  listings Listing[]
+
+  @@index([realtorProfileId])
+  @@index([area])
+}
+
+enum InspectionKind {
+  PHYSICAL
+  VIRTUAL
+  TITLE_DILIGENCE
+}
+
+enum InspectionSlot {
+  MORNING
+  AFTERNOON
+  EVENING
+}
+
+enum InspectionStatus {
+  REQUESTED
+  ACCEPTED
+  RESCHEDULE_PROPOSED
+  DECLINED
+  CANCELLED
+  COMPLETED
+}
+
+// A buyer's request to inspect a property. Always hangs off the buyer's
+// inquiry thread with that listing (so the lead-fee and one-thread-per-buyer
+// rules are untouched); the thread also gets a plain message for each step.
+// Rules live in packages/db/src/inspection.ts.
+model InspectionRequest {
+  id            String           @id @default(cuid())
+  inquiryId     String
+  inquiry       Inquiry          @relation(fields: [inquiryId], references: [id])
+  listingId     String
+  listing       Listing          @relation(fields: [listingId], references: [id])
+  buyerId       String
+  buyer         User             @relation("InspectionBuyer", fields: [buyerId], references: [id])
+  kind          InspectionKind
+  preferredDate DateTime         @db.Date
+  preferredSlot InspectionSlot
+  notes         String?
+  status        InspectionStatus @default(REQUESTED)
+  // Set when the realtor proposes another time (cleared once resolved).
+  proposedDate  DateTime?        @db.Date
+  proposedSlot  InspectionSlot?
+  // The agreed time, set when a request or a proposed new time is accepted.
+  scheduledDate DateTime?        @db.Date
+  scheduledSlot InspectionSlot?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@index([inquiryId])
+  @@index([buyerId, createdAt])
+  @@index([listingId, status])
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  inquiryId String
+  inquiry   Inquiry  @relation(fields: [inquiryId], references: [id])
+  senderId  String
+  sender    User     @relation(fields: [senderId], references: [id])
+  body      String
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([inquiryId, senderId, readAt])
+}
+
+model Review {
+  id               String         @id @default(cuid())
+  realtorProfileId String
+  realtorProfile   RealtorProfile @relation(fields: [realtorProfileId], references: [id])
+  authorId         String
+  author           User           @relation(fields: [authorId], references: [id])
+  rating           Int // 1-5
+  comment          String?
+  createdAt        DateTime       @default(now())
+}
+
+// ─────────────────────────────────────────────
+// NOTIFICATIONS — in-app + push, per Development Framework §19.
+// A push send and an in-app row are created together (see lib/notify.ts) —
+// the Notification row is the durable record either way, so in-app history
+// works even for a user who never granted push permission.
+// ─────────────────────────────────────────────
+
+enum NotificationType {
+  NEW_MESSAGE
+  INSPECTION_REQUESTED
+  INSPECTION_UPDATED
+  VERIFICATION_APPROVED
+  VERIFICATION_REJECTED
+  NEW_BOOKING_REQUEST // Phase 2 — customer requested a provider
+  BOOKING_ACCEPTED
+  BOOKING_DECLINED
+  BOOKING_COMPLETED
+  SAVED_SEARCH_MATCH
+  SERVICE_PROPOSAL_READY
+  SERVICE_PROPOSAL_ACCEPTED
+  SERVICE_PROPOSAL_DECLINED
+  SERVICE_MILESTONE_UPDATED
+  SERVICE_VISIT_SCHEDULED
+  SERVICE_VISIT_COMPLETED
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id])
+  type      NotificationType
+  title     String
+  body      String
+  data      Json? // e.g. { inquiryId } or { realtorProfileId } — lets the client deep-link on tap
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt]) // Readiness §2A "notification read state" — backs unreadCount/list-unread queries specifically
+}
+
+// Per-user channel preferences. In-app records remain durable and cannot be
+// disabled; channel flags govern outbound delivery only. Email/SMS/WhatsApp
+// remain dormant until a provider and verified contact workflow are configured.
+model NotificationPreference {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  push      Boolean  @default(true)
+  email     Boolean  @default(false)
+  sms       Boolean  @default(false)
+  whatsapp  Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────
+// PAYMENTS — Paystack, prepaid lead-fee balance model.
+// Blueprint §12: realtors pay per-lead, not commission-on-close (unverifiable).
+// Rather than charging a saved card in real time on every inquiry (fragile,
+// depends on a saved authorization existing), realtors top up a balance via
+// Paystack; each new inquiry deducts a fixed fee from that balance
+// server-side. See packages/api/src/routers/payments.ts for the full flow
+// and the explicit assumption about what happens on insufficient balance.
+// ─────────────────────────────────────────────
+
+enum PaymentTransactionType {
+  TOPUP
+  LEAD_FEE
+  SUBSCRIPTION
+  REFUND
+  COMMISSION // Phase 2 — accrued when a provider marks a ServiceRequest COMPLETED (see serviceRequests.complete)
+  COMMISSION_SETTLEMENT // Phase 2 — provider paying down commissionOwedNaira via Paystack; only ever set SUCCESS by the webhook, same rule as TOPUP/SUBSCRIPTION
+  MANUAL_ADJUSTMENT // Readiness §5B — an admin correction that isn't a REFUND (e.g. crediting a realtor for a platform-side billing bug). Always a new row, same as everything else here — never edit an existing transaction's amount.
+  REVERSED // Readiness §5B — marks that an earlier transaction (referenced via `note`, since Prisma relations to "the transaction this reverses" would need a nullable self-relation for a rare case) was undone. The original row is never deleted or edited; this is the compensating entry.
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+// Shared ledger for both sides of the marketplace: realtor lead-fee/subscription
+// billing (Phase 1) and provider commission billing (Phase 2). Exactly one of
+// realtorProfileId / providerProfileId is set per row — enforced at the
+// application layer (Prisma can't express an XOR constraint declaratively),
+// mirroring how Listing.videoUrl's SALE/RENT-only rule is enforced in code,
+// not the schema.
+model PaymentTransaction {
+  id               String                 @id @default(cuid())
+  realtorProfileId String?
+  realtorProfile   RealtorProfile?        @relation(fields: [realtorProfileId], references: [id])
+  providerProfileId String?
+  providerProfile  ProviderProfile?       @relation(fields: [providerProfileId], references: [id])
+  type             PaymentTransactionType
+  status           PaymentStatus          @default(PENDING)
+  amountNaira      BigInt
+  provider         String                 @default("paystack")
+  providerRef      String                 @unique // Paystack transaction reference — the idempotency key
+  inquiryId        String? // set for LEAD_FEE transactions
+  serviceRequestId String? // set for one-time/project COMMISSION transactions
+  serviceOccurrenceId String? // set for recurring-visit COMMISSION transactions
+  serviceOccurrence ServiceOccurrence? @relation(fields: [serviceOccurrenceId], references: [id])
+  note             String? // admin-entered reason — mirrors VerificationLog/ListingModerationLog's note field, mainly used for REFUND
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  @@index([realtorProfileId, createdAt])
+  @@index([providerProfileId, createdAt])
+  @@index([serviceOccurrenceId])
+}
+
+// ═════════════════════════════════════════════
+// PHASE 2 — HOME SERVICES (Blueprint §13)
+// Deliberately reuses Phase 1's trust pattern rather than inventing a new
+// one: ProviderProfile mirrors RealtorProfile (same VerificationStatus
+// enum, same *VerificationLog audit-trail shape), and ServiceRequest /
+// ServiceMessage mirror Inquiry / Message (in-app-first contact, same
+// anti-disintermediation reasoning from §10/§12). The five pilot departments
+// are fixed enum values; legacy trade values remain for compatibility.
+// ═════════════════════════════════════════════
+
+enum ServiceCategory {
+  // Legacy granular trades retained so existing provider records remain valid.
+  PAINTING
+  PLUMBING
+  FUMIGATION
+  ELECTRICAL
+  // Granular specialties beneath the five approved customer-facing departments.
+  SOLAR
+  CCTV
+  SECURITY_SYSTEMS
+  FURNITURE
+  CLEANING
+  MOVE_IN
+  PEST_CONTROL
+}
+
+enum OfferingPriceType {
+  FIXED // a flat quoted price for the job (e.g. "Standard 3-bedroom fumigation")
+  HOURLY // rate per hour, final price depends on job duration
+  QUOTE // no listed price — customer requests, provider quotes when accepting
+}
+
+enum ServiceTransactionType {
+  ONE_TIME
+  INSTALLATION_PROJECT
+  RECURRING
+}
+
+enum ServiceFrequency {
+  WEEKLY
+  FORTNIGHTLY
+  MONTHLY
+  QUARTERLY
+}
+
+enum ServiceQuoteStatus {
+  PROPOSED
+  ACCEPTED
+  DECLINED
+  SUPERSEDED
+}
+
+enum ServiceMilestoneStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  APPROVED
+}
+
+enum RecurringAgreementStatus {
+  PROPOSED
+  ACTIVE
+  CANCELLED
+  COMPLETED
+}
+
+enum ServiceOccurrenceStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum ServiceRequestStatus {
+  REQUESTED // customer submitted, awaiting provider response
+  PROPOSAL_PENDING // provider sent a project quote or recurring agreement for customer review
+  ACCEPTED // provider accepted / customer accepted terms; agreedPriceNaira is set
+  DECLINED
+  IN_PROGRESS
+  COMPLETED // triggers commission accrual — see serviceRequests.complete
+  CANCELLED // customer-initiated before work completion; recurring agreements can also be cancelled
+}
+
+model ProviderProfile {
+  id                    String              @id @default(cuid())
+  userId                String              @unique
+  user                  User                @relation(fields: [userId], references: [id])
+  businessName          String
+  categories            ServiceCategory[] // the trades this provider is verified for — offerings must be a subset
+  cacRegistrationNo     String?
+  idDocumentUrl         String?
+  bio                   String? // set in the "Create profile" step, after verification — not required to apply
+  serviceArea           String              @default("Abuja") // Phase 1 is single-city; same forward-compat field as Listing.city
+  // Public company profile (all optional, all supplied by the provider and NOT verified by ULTRA — the UI says so)
+  contactName           String?             // the person customers deal with, e.g. "Umar Sani"
+  contactRole           String?             // e.g. "COO"
+  operatingSince        Int?
+  specialties           String[]            @default([])
+  equipment             String[]            @default([])
+  proofVideoIds         String[]            @default([]) // validated YouTube IDs only, never pasted URLs
+  verificationStatus    VerificationStatus  @default(UNVERIFIED)
+  verifiedAt            DateTime?
+  verifiedByAdminId     String?
+  // Readiness §3A, Levels 1 & 2 — mirrors RealtorProfile's identical
+  // fields and identical reasoning: both set together at VERIFIED
+  // approval since the application already required both together.
+  identityVerified      Boolean             @default(false)
+  businessVerified      Boolean             @default(false)
+  rating                Float?
+  responseTimeMins      Int?
+  // Postpaid, not prepaid — the inverse of RealtorProfile.creditBalanceNaira.
+  // A realtor pre-loads a balance before generating leads; a provider
+  // accrues commission AFTER a job completes (see serviceRequests.complete),
+  // then settles what's owed via payments.settleCommission. Prepaying an
+  // unknown job price doesn't fit the same way a fixed per-inquiry fee does.
+  commissionOwedNaira   BigInt              @default(0)
+  subscriptionTier      SubscriptionTier    @default(FREE)
+  subscriptionExpiresAt DateTime?
+  // Grace period: providers can accept jobs on the FREE tier with no
+  // subscription requirement until this date, even though commission still
+  // accrues from job one — the explicit product decision was to waive the
+  // *subscription* requirement early on, not the commission itself. Set on
+  // VERIFIED approval (see providers.adminSetVerificationStatus). Search
+  // ranking / new-request eligibility checks this the same way listings.ts
+  // checks subscriptionExpiresAt: computed against "now" at read time, no
+  // cron job needed to "turn it off."
+  freeUntil             DateTime?
+  createdAt             DateTime            @default(now())
+
+  offerings           Offering[]
+  serviceRequests     ServiceRequest[]
+  serviceQuotes       ServiceQuote[]
+  recurringAgreements RecurringAgreement[]
+  verificationLogs    ProviderVerificationLog[]
+  paymentTransactions PaymentTransaction[]
+
+  @@index([verificationStatus])
+}
+
+// Mirrors VerificationLog exactly — same audit-trail shape, separate table
+// because it references ProviderProfile, not RealtorProfile.
+model ProviderVerificationLog {
+  id                String              @id @default(cuid())
+  providerProfileId String
+  providerProfile   ProviderProfile     @relation(fields: [providerProfileId], references: [id])
+  fromStatus        VerificationStatus
+  toStatus          VerificationStatus
+  note              String?
+  actorAdminId      String?
+  createdAt         DateTime            @default(now())
+}
+
+model Offering {
+  id                String            @id @default(cuid())
+  providerProfileId String
+  providerProfile   ProviderProfile   @relation(fields: [providerProfileId], references: [id])
+  category          ServiceCategory
+  title             String
+  description       String
+  priceType         OfferingPriceType
+  priceNaira        BigInt? // required for FIXED/HOURLY, null for QUOTE — enforced in the router, same pattern as Listing.videoUrl
+  active            Boolean           @default(true) // provider-controlled pause, doesn't require re-verification
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  serviceRequests ServiceRequest[]
+
+  @@index([providerProfileId, active])
+  @@index([category])
+}
+
+model ServiceRequest {
+  id                String                @id @default(cuid())
+  customerId        String
+  customer          User                  @relation("ServiceRequestCustomer", fields: [customerId], references: [id])
+  providerProfileId String
+  providerProfile   ProviderProfile       @relation(fields: [providerProfileId], references: [id])
+  offeringId        String?
+  offering          Offering?             @relation(fields: [offeringId], references: [id])
+  category          ServiceCategory // denormalized from the offering (or set directly for a QUOTE-only request) so a request survives an offering being edited/deactivated later
+  transactionType   ServiceTransactionType @default(ONE_TIME)
+  unitCount         Int                   @default(1) // supports estate/developer bulk installation requests
+  siteName          String?
+  siteAddress       String? // customer-supplied service location; never treated as a verified property address
+  preferredAt       DateTime? // customer's requested visit/start time; provider confirms scheduledAt
+  requestedFrequency ServiceFrequency? // customer preference for recurring work
+  status            ServiceRequestStatus  @default(REQUESTED)
+  note              String? // customer's description of the job at request time
+  scheduledAt       DateTime?
+  agreedPriceNaira  BigInt? // set by the provider on accept; may be revised at completion (see `complete`)
+  commissionNaira   BigInt? // one-time/project commission, computed once at completion — see lib/commission.ts
+  commissionBilled  Boolean               @default(false)
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  messages ServiceMessage[]
+  quotes ServiceQuote[]
+  recurringAgreements RecurringAgreement[]
+
+  @@index([providerProfileId, status])
+  @@index([status]) // Readiness §2A "service request status" — standalone, for admin/cross-provider queries the composite doesn't serve
+  @@index([customerId])
+}
+
+model ServiceQuote {
+  id                    String             @id @default(cuid())
+  requestId             String
+  request               ServiceRequest     @relation(fields: [requestId], references: [id])
+  providerProfileId     String
+  providerProfile       ProviderProfile     @relation(fields: [providerProfileId], references: [id])
+  version               Int
+  scopeSummary          String
+  totalPriceNaira       BigInt
+  estimatedDurationDays Int
+  validUntil            DateTime?
+  status                ServiceQuoteStatus @default(PROPOSED)
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+  milestones            ServiceMilestone[]
+
+  @@unique([requestId, version])
+  @@index([requestId, status])
+}
+
+model ServiceMilestone {
+  id           String                @id @default(cuid())
+  quoteId      String
+  quote        ServiceQuote          @relation(fields: [quoteId], references: [id])
+  title        String
+  description  String?
+  amountNaira  BigInt
+  sortOrder    Int                   @default(0)
+  status       ServiceMilestoneStatus @default(PENDING)
+  completedAt  DateTime?
+  approvedAt   DateTime?
+  createdAt    DateTime              @default(now())
+  updatedAt    DateTime              @updatedAt
+
+  @@index([quoteId, sortOrder])
+}
+
+model RecurringAgreement {
+  id                 String                  @id @default(cuid())
+  requestId          String
+  request            ServiceRequest          @relation(fields: [requestId], references: [id])
+  version            Int
+  providerProfileId  String
+  providerProfile    ProviderProfile       @relation(fields: [providerProfileId], references: [id])
+  customerId         String
+  customer           User                  @relation("RecurringAgreementCustomer", fields: [customerId], references: [id])
+  frequency          ServiceFrequency
+  serviceScope       String
+  pricePerVisitNaira BigInt
+  startAt            DateTime
+  endAt              DateTime?
+  nextServiceAt      DateTime
+  status             RecurringAgreementStatus @default(PROPOSED)
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  occurrences        ServiceOccurrence[]
+
+  @@unique([requestId, version])
+  @@index([providerProfileId, status])
+  @@index([customerId, status])
+}
+
+model ServiceOccurrence {
+  id                String                  @id @default(cuid())
+  agreementId       String
+  agreement         RecurringAgreement      @relation(fields: [agreementId], references: [id])
+  scheduledAt       DateTime
+  status            ServiceOccurrenceStatus @default(SCHEDULED)
+  finalPriceNaira   BigInt?
+  commissionNaira   BigInt?
+  commissionBilled  Boolean                 @default(false)
+  completedAt       DateTime?
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+  paymentTransactions PaymentTransaction[]
+
+  @@unique([agreementId, scheduledAt])
+  @@index([agreementId, status])
+}
+
+model ServiceMessage {
+  id               String         @id @default(cuid())
+  serviceRequestId String
+  serviceRequest   ServiceRequest @relation(fields: [serviceRequestId], references: [id])
+  senderId         String
+  sender           User           @relation(fields: [senderId], references: [id])
+  body             String
+  readAt           DateTime?
+  createdAt        DateTime       @default(now())
+
+  @@index([serviceRequestId, senderId, readAt])
+}
+
+// ═════════════════════════════════════════════
+// TRUST — Readiness §3D: reporting & escalation
+// Scoped to Listing for now, per that section's explicit examples
+// (duplicate listing, wrong price, false photos, etc.) — a Phase 2
+// equivalent for ServiceRequest/ProviderProfile is a natural extension of
+// this exact shape later, not built this pass.
+// ═════════════════════════════════════════════
+
+enum ReportReason {
+  DUPLICATE_LISTING
+  WRONG_PRICE
+  WRONG_LOCATION
+  FALSE_PHOTOS
+  PROPERTY_UNAVAILABLE
+  SUSPECTED_FRAUD
+  HARASSMENT
+  UNAUTHORIZED_LISTING
+}
+
+enum ReportStatus {
+  OPEN
+  REVIEWING
+  RESOLVED
+  DISMISSED
+}
+
+model Report {
+  id             String       @id @default(cuid())
+  listingId      String
+  listing        Listing      @relation(fields: [listingId], references: [id])
+  reporterId     String
+  reporter       User         @relation(fields: [reporterId], references: [id])
+  reason         ReportReason
+  comment        String?
+  status         ReportStatus @default(OPEN)
+  resolutionNote String?
+  resolvedByAdminId String?
+  resolvedAt     DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([listingId])
+  @@index([status])
+}
+
+// ═════════════════════════════════════════════
+// Gate B #6 — configurable pricing. LEAD_FEE_NAIRA and COMMISSION_RATE_BPS
+// were hardcoded constants (with an explicit "not a confirmed business
+// figure" comment each) — this is the DB-backed config those constants
+// now defer to. Deliberately a single-row table (id is always "default"),
+// not a generic key-value store: there are exactly two figures that need
+// to be admin-editable right now, and a real config table beats an
+// over-generic settings blob that invites unstructured growth.
+// ═════════════════════════════════════════════
+
+model PlatformConfig {
+  id                 String   @id @default("default")
+  leadFeeNaira       BigInt   @default(500)
+  commissionRateBps  Int      @default(1000) // 1000 = 10%
+  // Priority-checklist fix (architecture report G-4 / security audit,
+  // both independently flagged the same inconsistency): these two prices
+  // used to be hardcoded module constants (SUBSCRIPTION_PRICE_NAIRA in
+  // realtors.ts, PROVIDER_SUBSCRIPTION_PRICE_NAIRA in providers.ts) while
+  // leadFeeNaira/commissionRateBps — the conceptually identical "pricing
+  // knob" category — were already admin-editable here. Changing a
+  // subscription price required a code deploy; changing the lead fee
+  // didn't. Same table, same upsert-with-defaults pattern (see
+  // getPlatformConfig in platformConfig.ts) as the two fields above, so
+  // no change to that helper function is needed — Prisma's schema
+  // @default populates these on first upsert exactly like it already
+  // does for leadFeeNaira.
+  realtorSubscriptionPriceNaira  BigInt @default(15000)
+  providerSubscriptionPriceNaira BigInt @default(10000)
+  updatedAt          DateTime @updatedAt
+  updatedByAdminId   String?
+}
+
+// ═════════════════════════════════════════════
+// Optimization Sprint A — analytics event tracking. Every prior session
+// note touching this said the same thing: retrofitting after real usage
+// exists loses the early data permanently, unlike almost everything else
+// on that backlog which can be fixed after the fact. This is the durable
+// first-party record — see lib/analytics.ts for the "always write this
+// row, best-effort forward to a real analytics provider" pattern, which
+// deliberately mirrors lib/notify.ts's existing durable-row-first
+// convention rather than inventing a different one.
+//
+// userId is a plain nullable string, NOT a relation — analytics events
+// for an anonymous browser (search_performed before sign-in) have no
+// user at all, and a deleted account's historical events should survive
+// as an anonymous-looking record the same way DATA_RETENTION.md already
+// reasons about other retained-but-redacted data, not cascade-delete.
+// ═════════════════════════════════════════════
+
+
+
+// ─────────────────────────────────────────────
+// SUPPORT — durable customer support cases and threaded replies.
+// Admin assignment is a scalar reference so historical tickets survive
+// admin demotion/deactivation; every status/assignment change is audited.
+// ─────────────────────────────────────────────
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_ON_CUSTOMER
+  RESOLVED
+  CLOSED
+}
+
+enum SupportTicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum SupportTicketCategory {
+  ACCOUNT
+  LISTING
+  PAYMENT
+  INSPECTION
+  HOME_SERVICES
+  SAFETY_OR_FRAUD
+  OTHER
+}
+
+model SupportTicket {
+  id             String                @id @default(cuid())
+  requesterId    String
+  requester      User                  @relation("SupportTicketRequester", fields: [requesterId], references: [id])
+  subject        String                @db.VarChar(160)
+  description    String                @db.Text
+  category       SupportTicketCategory @default(OTHER)
+  priority       SupportTicketPriority @default(NORMAL)
+  status         SupportTicketStatus   @default(OPEN)
+  assignedAdminId String?
+  resolutionNote String?               @db.Text
+  resolvedAt     DateTime?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  messages       SupportTicketMessage[]
+
+  @@index([status, priority, createdAt])
+  @@index([requesterId, createdAt])
+  @@index([assignedAdminId, status])
+}
+
+model SupportTicketMessage {
+  id        String        @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User          @relation("SupportTicketMessageAuthor", fields: [authorId], references: [id])
+  body      String        @db.Text
+  internal  Boolean       @default(false)
+  createdAt DateTime      @default(now())
+
+  @@index([ticketId, createdAt])
+}
+
+model AdminAuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String
+  action      String
+  targetType  String
+  targetId    String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([actorUserId, createdAt])
+  @@index([targetType, targetId, createdAt])
+}
+
+model AnalyticsEvent {
+  id         String   @id @default(cuid())
+  type       String
+  userId     String?
+  properties Json?
+  createdAt  DateTime @default(now())
+
+  @@index([type, createdAt])
+  @@index([userId])
+}

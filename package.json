@@ -1,0 +1,33 @@
+{
+  "name": "ultra",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "turbo run dev --filter=@ultra/web",
+    "dev:mobile": "turbo run dev --filter=@ultra/mobile",
+    "db:generate": "turbo run db:generate --filter=@ultra/db",
+    "db:migrate": "turbo run db:migrate --filter=@ultra/db",
+    "db:seed": "pnpm --filter @ultra/db seed",
+    "db:seed:staging": "pnpm --filter @ultra/db seed:staging",
+    "verify:migration": "bash scripts/verify-migration.sh",
+    "build": "pnpm db:generate && turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "pnpm db:generate && turbo run typecheck",
+    "test:unit": "pnpm --filter @ultra/db test && pnpm --filter @ultra/api test:unit",
+    "test:integration": "pnpm --filter @ultra/api test:integration",
+    "db:baseline:generate": "bash scripts/generate-migration-baseline.sh",
+    "check:pilot-env": "node scripts/check-pilot-env.mjs"
+  },
+  "devDependencies": {
+    "turbo": "^2.1.0",
+    "typescript": "^5.5.4",
+    "prettier": "^3.3.3"
+  },
+  "packageManager": "pnpm@9.7.0",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

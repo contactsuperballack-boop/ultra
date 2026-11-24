@@ -1,0 +1,29 @@
+{
+  "name": "@ultra/api",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test:unit": "tsx --test tests/unit/**/*.test.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ultra/db": "workspace:*",
+    "@trpc/server": "^11.0.0-rc.446",
+    "zod": "^3.23.8",
+    "jsonwebtoken": "^9.0.2",
+    "ioredis": "^5.4.1",
+    "@sentry/node": "^8.26.0",
+    "@aws-sdk/client-s3": "^3.637.0",
+    "@aws-sdk/s3-request-presigner": "^3.637.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/jsonwebtoken": "^9.0.6",
+    "vitest": "^2.0.5",
+    "tsx": "^4.16.2",
+    "@types/node": "^22.1.0"
+  }
+}
